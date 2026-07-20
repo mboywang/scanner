@@ -36,6 +36,23 @@ class ScannerApp:
         # scanned pages are never lost, even if the app was closed mid-scan.
         threading.Thread(target=self._startup_recovery, daemon=True).start()
 
+        # Periodically merge any rows queued while Excel was locked, so they
+        # land shortly after the workbook is closed (no need to scan again).
+        self.root.after(30000, self._periodic_flush)
+
+    def _periodic_flush(self):
+        """Try to merge queued rows into the Excel log, then reschedule."""
+        def work():
+            try:
+                merged = self.xlsx.flush_pending()
+                if merged:
+                    self.set_ocr_status(
+                        f"Merged {merged} pending row(s) into the Excel log", success=True)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(30000, self._periodic_flush)
+
     def _startup_recovery(self):
         """Convert leftover pages from an interrupted session into PDFs, and
         flush any Excel rows queued while the workbook was previously locked."""

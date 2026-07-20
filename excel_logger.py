@@ -2,13 +2,14 @@
 Appends scanned-document records to the finance team's Excel log
 (`Scanned Documents Log.xlsx`, sheet "Document Log").
 
-If the workbook is open in Excel (Windows file lock), rows are queued to a
-local pending file and flushed automatically on the next successful write, so
-nothing is ever lost.
+If the workbook is open in Excel (Windows file lock), rows are written to a
+visible fallback CSV next to it (`Scanned Documents Log (pending).csv`) and
+merged into the workbook automatically as soon as it is unlocked -- so nothing
+is ever lost and the pending items stay readable in the meantime.
 """
 import os
-import json
-import tempfile
+import csv
+import threading
 from datetime import datetime
 
 import openpyxl
@@ -27,9 +28,11 @@ class ExcelLogger:
     def __init__(self, xlsx_path):
         self.xlsx_path = xlsx_path
         self.log = get_logger()
-        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-        self.pending_path = os.path.join(base, "ScannerApp", "pending_rows.jsonl")
-        os.makedirs(os.path.dirname(self.pending_path), exist_ok=True)
+        # Visible fallback log lives next to the workbook.
+        stem = os.path.splitext(os.path.basename(xlsx_path))[0]
+        self.pending_path = os.path.join(os.path.dirname(xlsx_path), f"{stem} (pending).csv")
+        # Serialize all workbook writes (OCR worker + periodic flush may race).
+        self._lock = threading.Lock()
 
     # ---- public API -----------------------------------------------------
     def append_scan(self, pdf_path, fields, filed_location="", subfolder=""):
@@ -43,20 +46,25 @@ class ExcelLogger:
             row["Filed Location"] = filed_location
         if subfolder:
             row["Subfolder"] = subfolder
-        self._append_rows([row])
+        with self._lock:
+            self._append_rows([row])
 
     def flush_pending(self):
-        """Try to write any previously-queued rows. Returns count flushed."""
-        queued = self._read_pending()
-        if not queued:
-            return 0
-        try:
-            self._write_rows(queued)
-        except PermissionError:
-            return 0  # still locked; leave the queue in place
-        self._clear_pending()
-        activity(self.log, f"Excel: flushed {len(queued)} queued row(s) into the log")
+        """Try to merge any queued rows into the workbook. Returns count flushed."""
+        with self._lock:
+            queued = self._read_pending()
+            if not queued:
+                return 0
+            try:
+                self._write_rows(queued)
+            except PermissionError:
+                return 0  # still locked; leave the fallback CSV in place
+            self._clear_pending()
+        activity(self.log, f"Excel: merged {len(queued)} pending row(s) from the fallback log")
         return len(queued)
+
+    def pending_count(self):
+        return len(self._read_pending())
 
     # ---- row building ---------------------------------------------------
     def _row_from_fields(self, pdf_path, f):
@@ -77,9 +85,9 @@ class ExcelLogger:
             "Subfolder": f.get("subfolder", ""),
         }
 
-    # ---- writing --------------------------------------------------------
+    # ---- writing (callers must hold self._lock) -------------------------
     def _append_rows(self, rows):
-        # Always try to drain the queue first so order is roughly preserved.
+        # Drain the fallback queue first so ordering is roughly preserved.
         all_rows = self._read_pending() + rows
         try:
             self._write_rows(all_rows)
@@ -89,11 +97,11 @@ class ExcelLogger:
                          f"Excel: logged '{r['Original Filename']}' "
                          f"(sender='{r['Sender Name']}', amount='{r['Amount Due']}')")
         except PermissionError:
-            # Workbook is open in Excel - queue for later instead of losing data.
+            # Workbook is open in Excel - write to the visible fallback CSV.
             self._queue(rows)
             activity(self.log,
-                     f"Excel locked (open in Excel?) - queued {len(rows)} row(s) "
-                     f"to add automatically later")
+                     f"Excel locked (open in Excel?) - wrote {len(rows)} row(s) to "
+                     f"'{os.path.basename(self.pending_path)}'; will merge when unlocked")
 
     def _write_rows(self, rows):
         """Open the workbook, append rows to the Document Log sheet, save."""
@@ -106,37 +114,37 @@ class ExcelLogger:
             ws.title = SHEET_NAME
             ws.append(COLUMNS)
 
-        # Map each expected column to its position from the header row.
         header = [c.value for c in ws[1]]
         col_index = {name: i for i, name in enumerate(header) if name in COLUMNS}
-
         for row in rows:
             values = [""] * len(header)
             for name, idx in col_index.items():
                 values[idx] = row.get(name, "")
             ws.append(values)
-
         wb.save(self.xlsx_path)
 
-    # ---- pending queue --------------------------------------------------
+    # ---- fallback CSV queue ---------------------------------------------
     def _queue(self, rows):
-        with open(self.pending_path, "a", encoding="utf-8") as fh:
-            for r in rows:
-                fh.write(json.dumps(r) + "\n")
+        exists = os.path.exists(self.pending_path)
+        try:
+            with open(self.pending_path, "a", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.DictWriter(fh, fieldnames=COLUMNS)
+                if not exists:
+                    writer.writeheader()
+                for r in rows:
+                    writer.writerow({c: r.get(c, "") for c in COLUMNS})
+        except Exception as e:
+            # Last resort: never crash a scan over logging.
+            self.log.exception("Failed to write fallback pending CSV: %s", e)
 
     def _read_pending(self):
         if not os.path.exists(self.pending_path):
             return []
-        rows = []
-        with open(self.pending_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        continue
-        return rows
+        try:
+            with open(self.pending_path, "r", newline="", encoding="utf-8-sig") as fh:
+                return [dict(r) for r in csv.DictReader(fh)]
+        except Exception:
+            return []
 
     def _clear_pending(self):
         try:
