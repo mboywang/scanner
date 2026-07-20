@@ -2,6 +2,7 @@ import os
 import shutil
 from pathlib import Path
 import re
+from scanner_log import get_logger, activity
 
 try:
     import pdfplumber
@@ -10,9 +11,28 @@ except ImportError:
 
 
 class DocumentProcessor:
-    def __init__(self, base_folder):
+    def __init__(self, base_folder, use_ocr=True):
         self.base_folder = base_folder
+        self.log = get_logger()
+        self.use_ocr = use_ocr
+        self._ocr = None  # lazily created QwenOCR (heavy model)
         self.categories = self._load_categories()
+
+    def _get_ocr(self, callback=None):
+        """Lazily create the Qwen OCR engine. Returns None if unavailable."""
+        if not self.use_ocr:
+            return None
+        if self._ocr is None:
+            try:
+                from qwen_ocr import QwenOCR
+                self._ocr = QwenOCR(callback=callback)
+            except Exception as e:
+                self.log.warning("OCR unavailable: %s", e)
+                self.use_ocr = False
+                return None
+        else:
+            self._ocr.callback = callback
+        return self._ocr
 
     def _load_categories(self):
         """Load category folders and build keyword mappings"""
@@ -60,6 +80,21 @@ class DocumentProcessor:
                     if callback:
                         callback(f"pdfplumber error: {e}")
 
+            # No embedded text -> image-only scan. Fall back to OCR.
+            if not text.strip():
+                ocr = self._get_ocr(callback=callback)
+                if ocr is not None:
+                    self.log.info("No embedded text in %s - running OCR",
+                                  os.path.basename(pdf_path))
+                    if callback:
+                        callback("No text found - running OCR...")
+                    ocr_text = ocr.extract_text_from_pdf(pdf_path)
+                    if ocr_text and ocr_text.strip():
+                        activity(self.log,
+                                 f"OCR read {len(ocr_text.strip())} chars from "
+                                 f"'{os.path.basename(pdf_path)}'")
+                        return ocr_text
+
             return text
 
         except Exception as e:
@@ -98,6 +133,11 @@ class DocumentProcessor:
         # Combine scores
         for category, score in content_scores.items():
             scores[category] = scores.get(category, 0) + score
+
+        # Record the decision and its reasoning for human review.
+        top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        self.log.info("Categorize '%s': text=%d chars, scores=%s",
+                      filename, len(text.strip()), top or "none")
 
         if scores:
             best_category = max(scores, key=scores.get)
@@ -186,19 +226,24 @@ class DocumentProcessor:
             category = self.categorize_document(pdf_path, callback)
 
             if not category:
+                activity(self.log, f"PROCESS could not categorize '{filename}' (left in place)")
                 if callback:
                     callback(f"Could not categorize {filename}")
                 return False
 
             # Move file
             if auto_move:
-                self.move_file(pdf_path, category)
+                destination = self.move_file(pdf_path, category)
+                note = " (no confident match)" if category == 'Dump for Review' else ""
+                activity(self.log, f"MOVED '{filename}' -> {category}{note}")
+                self.log.debug("Destination: %s", destination)
                 if callback:
                     callback(f"Moved to: {category}")
 
             return True
 
         except Exception as e:
+            activity(self.log, f"PROCESS ERROR on '{os.path.basename(pdf_path)}': {e}")
             if callback:
                 callback(f"Error processing file: {e}")
             return False
