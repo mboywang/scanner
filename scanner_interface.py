@@ -43,6 +43,36 @@ class ScannerInterface:
             counter += 1
         return output_path
 
+    def _is_blank_page(self, img):
+        """
+        Heuristic blank-page test, used to drop the empty back-sides that duplex
+        scanning produces for single-sided documents.
+
+        A page is "blank" when almost none of its pixels are dark enough to be
+        ink. The test deliberately errs toward KEEPING a page when uncertain so
+        that genuine (even sparse) content is never discarded.
+        """
+        try:
+            gray = img.convert('L')
+            # Ignore a thin border so feeder-edge shadows / black margins from
+            # the ADF are not mistaken for content.
+            w, h = gray.size
+            mx, my = int(w * 0.04), int(h * 0.04)
+            if w - 2 * mx > 20 and h - 2 * my > 20:
+                gray = gray.crop((mx, my, w - mx, h - my))
+            hist = gray.histogram()
+            total = sum(hist) or 1
+            # Pixels darker than ~190/255 count as ink (text / graphics); paper
+            # white on this scanner sits well above that. Threshold picked from
+            # measured 300-DPI pages: dust/noise ~0.03%, while the sparsest real
+            # content (a short note or a signature) is ~0.17%. 0.1% sits safely
+            # between, so noise is dropped but faint content is kept.
+            ink = sum(hist[:190])
+            return (ink / total) < 0.001
+        except Exception:
+            # If we can't tell, treat the page as non-blank so it is kept.
+            return False
+
     def _pages_to_pdf(self, batch_dir, callback=None):
         """
         Convert every scanned page (page_*.bmp) in batch_dir into a single PDF
@@ -57,8 +87,25 @@ class ScannerInterface:
         if callback:
             callback(f"Converting {len(page_files)} pages to PDF...")
 
-        images = []
+        # Classify pages first so blank duplex back-sides can be dropped. We do
+        # this in a separate pass so that if EVERY page looks blank we keep them
+        # all rather than turning a scan into an empty PDF (never lose a scan).
+        blank_flags = {}
         for page_file in page_files:
+            try:
+                with Image.open(page_file) as probe:
+                    probe.load()
+                    blank_flags[page_file] = self._is_blank_page(probe)
+            except Exception:
+                blank_flags[page_file] = False  # unreadable != blank
+        drop_blanks = not all(blank_flags.get(p, False) for p in page_files)
+
+        images = []
+        skipped_blank = 0
+        for page_file in page_files:
+            if drop_blanks and blank_flags.get(page_file):
+                skipped_blank += 1
+                continue
             try:
                 img = Image.open(page_file)
                 if img.mode != 'RGB':
@@ -70,6 +117,9 @@ class ScannerInterface:
             except Exception:
                 # Skip an unreadable page but keep the rest of the scan.
                 continue
+
+        if skipped_blank:
+            activity(self.log, f"Skipped {skipped_blank} blank page(s)")
 
         if not images:
             return None
@@ -154,6 +204,28 @@ If objDeviceManager.DeviceInfos.Count > 0 Then
         Wscript.Quit 1
     End If
 
+    ' --- Enable duplex (double-sided) scanning ---
+    ' Without this, the ADF still feeds both sides but WIA returns a BLANK
+    ' image for the back. We set WIA_DPS_DOCUMENT_HANDLING_SELECT (prop 3088)
+    ' to FEEDER (1) + DUPLEX (4) = 5, but only if the device reports duplex
+    ' support in WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES (prop 3086, DUPLEX bit
+    ' = 4). Property access is best-effort: failures are non-fatal so a
+    ' simplex-only scanner still scans normally.
+    Dim dupCaps
+    dupCaps = 0
+    dupCaps = objDevice.Properties("3086").Value
+    If Err.Number = 0 And (dupCaps And 4) = 4 Then
+        objDevice.Properties("3088").Value = 5
+        If Err.Number = 0 Then
+            Wscript.Echo "DUPLEX:on"
+        Else
+            Wscript.Echo "DUPLEX:set_failed"
+        End If
+    Else
+        Wscript.Echo "DUPLEX:unsupported"
+    End If
+    Err.Clear
+
     Set objItem = objDevice.Items(1)
 
     Dim pageCount
@@ -208,11 +280,14 @@ End If
             )
             output = (result.stdout or "").strip()
 
-            # Report per-page progress
+            # Report per-page progress and record the duplex outcome so a blank
+            # back-side problem is diagnosable from the log without re-scanning.
             for line in output.split('\n'):
                 line = line.strip()
                 if line.startswith('PAGE:') and callback:
                     callback(f"Scanned page {line.split(':')[1]}...")
+                elif line.startswith('DUPLEX:'):
+                    self.log.info("Duplex status: %s", line.split(':', 1)[1])
 
             # SALVAGE: build the PDF from whatever pages reached disk, even if
             # the script reported a partial error (e.g. ERROR_SAVE mid-batch).
