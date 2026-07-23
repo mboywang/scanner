@@ -7,6 +7,24 @@ from PIL import Image
 import shutil
 from scanner_log import get_logger, activity
 
+# Scanned pages are written as page_0001.png, page_0002.png, ... by NAPS2.
+# (Older builds used .bmp via WIA; match both so a leftover batch from a
+# previous version can still be recovered.)
+PAGE_GLOB = "page_*.png"
+PAGE_GLOB_LEGACY = "page_*.bmp"
+
+# NAPS2 (bundled/installed) is used to drive the scanner. Its console handles
+# duplex ADF scanning reliably, unlike the legacy WIA Transfer() path which
+# failed with out-of-memory errors on duplex for the Epson ES-500W II.
+NAPS2_CONSOLE_CANDIDATES = [
+    r"C:\Program Files\NAPS2\NAPS2.Console.exe",
+    r"C:\Program Files (x86)\NAPS2\NAPS2.Console.exe",
+]
+# Inexact device-name match (NAPS2 accepts partial names). Specific enough to
+# pick the Epson, tolerant of naming variants ("ES-500WII" / "ES-500W II").
+SCANNER_DEVICE_MATCH = "ES-500"
+
+
 class ScannerInterface:
     def __init__(self):
         self.output_folder = r"C:\Users\mboyw\MSPbots.ai\Back Office Team - Home scanner"
@@ -43,6 +61,20 @@ class ScannerInterface:
             counter += 1
         return output_path
 
+    def _find_naps2(self):
+        """Return the path to NAPS2.Console.exe, or None if not installed."""
+        for path in NAPS2_CONSOLE_CANDIDATES:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _page_files(self, batch_dir):
+        """All scanned page images in a batch, in scan order (png, then any
+        legacy bmp), so PDF assembly and page counting share one source."""
+        files = glob.glob(os.path.join(batch_dir, PAGE_GLOB))
+        files += glob.glob(os.path.join(batch_dir, PAGE_GLOB_LEGACY))
+        return sorted(files)
+
     def _is_blank_page(self, img):
         """
         Heuristic blank-page test, used to drop the empty back-sides that duplex
@@ -75,12 +107,12 @@ class ScannerInterface:
 
     def _pages_to_pdf(self, batch_dir, callback=None):
         """
-        Convert every scanned page (page_*.bmp) in batch_dir into a single PDF
-        saved to the output folder. Returns the output path, or None if there
-        were no usable pages. This is the salvage path: it builds a PDF from
+        Convert every scanned page image in batch_dir into a single PDF saved
+        to the output folder. Returns the output path, or None if there were no
+        usable pages. This is the salvage path: it builds a PDF from
         whatever actually made it to disk, regardless of how the scan ended.
         """
-        page_files = sorted(glob.glob(os.path.join(batch_dir, "page_*.bmp")))
+        page_files = self._page_files(batch_dir)
         if not page_files:
             return None
 
@@ -184,114 +216,55 @@ class ScannerInterface:
             "batch_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         )
         os.makedirs(batch_dir, exist_ok=True)
-        vbs_script = os.path.join(batch_dir, "multi_scan.vbs")
+
+        naps2 = self._find_naps2()
+        if naps2 is None:
+            activity(self.log, "SCAN FAILED - NAPS2 not installed")
+            if callback:
+                callback("Scanner software (NAPS2) not found")
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return False
 
         try:
             self.log.info("Scan started (batch %s)", os.path.basename(batch_dir))
             if callback:
                 callback("Scanning all pages...")
 
-            # VBScript that scans multiple pages by calling Transfer() repeatedly
-            vbs_content = f'''Set objDeviceManager = CreateObject("WIA.DeviceManager")
-
-On Error Resume Next
-
-If objDeviceManager.DeviceInfos.Count > 0 Then
-    Set objDevice = objDeviceManager.DeviceInfos(1).Connect()
-
-    If Err.Number <> 0 Then
-        Wscript.Echo "ERROR_CONNECT"
-        Wscript.Quit 1
-    End If
-
-    ' --- Enable duplex (double-sided) scanning ---
-    ' Without this, the ADF still feeds both sides but WIA returns a BLANK
-    ' image for the back. We set WIA_DPS_DOCUMENT_HANDLING_SELECT (prop 3088)
-    ' to FEEDER (1) + DUPLEX (4) = 5, but only if the device reports duplex
-    ' support in WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES (prop 3086, DUPLEX bit
-    ' = 4). Property access is best-effort: failures are non-fatal so a
-    ' simplex-only scanner still scans normally.
-    Dim dupCaps
-    dupCaps = 0
-    dupCaps = objDevice.Properties("3086").Value
-    If Err.Number = 0 And (dupCaps And 4) = 4 Then
-        objDevice.Properties("3088").Value = 5
-        If Err.Number = 0 Then
-            Wscript.Echo "DUPLEX:on"
-        Else
-            Wscript.Echo "DUPLEX:set_failed"
-        End If
-    Else
-        Wscript.Echo "DUPLEX:unsupported"
-    End If
-    Err.Clear
-
-    Set objItem = objDevice.Items(1)
-
-    Dim pageCount
-    pageCount = 0
-
-    Dim i
-    For i = 1 To 999
-        Err.Clear
-
-        ' Each Transfer() call gets next page from feeder
-        Set objImage = objItem.Transfer()
-
-        If Err.Number <> 0 Then
-            ' Feeder empty - we're done
-            If pageCount > 0 Then
-                Wscript.Echo "DONE:" & pageCount
-                Wscript.Quit 0
-            Else
-                Wscript.Echo "ERROR_NO_PAGES"
-                Wscript.Quit 1
-            End If
-        End If
-
-        pageCount = pageCount + 1
-        Dim filePath
-        filePath = "{batch_dir}\\page_" & Right("00000" & pageCount, 5) & ".bmp"
-        objImage.SaveFile(filePath)
-
-        If Err.Number <> 0 Then
-            Wscript.Echo "ERROR_SAVE"
-            Wscript.Quit 1
-        End If
-
-        Wscript.Echo "PAGE:" & pageCount
-    Next
-
-Else
-    Wscript.Echo "ERROR_NO_SCANNER"
-    Wscript.Quit 1
-End If
-'''
-
-            with open(vbs_script, 'w', encoding='utf-8') as f:
-                f.write(vbs_content)
-
-            # Run the VBScript
+            # Drive the scan through NAPS2's console. TWAIN + duplex reliably
+            # captures BOTH sides of every sheet; the legacy WIA Transfer() path
+            # failed with out-of-memory when duplex was requested on this Epson.
+            # Each page is written as its own image (page_0001.png, ...) into the
+            # persistent batch folder, so the existing salvage / blank-skip /
+            # PDF-assembly pipeline is reused and a partial scan is never wasted.
+            # Duplex is always on; blank back-sides of single-sided documents are
+            # dropped later by _is_blank_page().
+            cmd = [
+                naps2,
+                "-o", os.path.join(batch_dir, "page_$(nnnn).png"),
+                "--driver", "twain",
+                "--device", SCANNER_DEVICE_MATCH,
+                "--source", "duplex",
+                "--dpi", "300",
+                "--bitdepth", "color",
+                "--noprofile",
+                "-f",  # overwrite (batch dir is fresh, but be explicit)
+                "-v",  # verbose: emit per-page progress we relay to the UI
+            ]
             result = subprocess.run(
-                ['cscript.exe', vbs_script],
-                capture_output=True,
-                text=True,
-                timeout=300
+                cmd, capture_output=True, text=True, timeout=300
             )
-            output = (result.stdout or "").strip()
+            output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+            self.log.debug("NAPS2 (exit %s) output:\n%s", result.returncode, output)
 
-            # Report per-page progress and record the duplex outcome so a blank
-            # back-side problem is diagnosable from the log without re-scanning.
+            # Relay NAPS2's per-page progress ("Scanned page N.") to the UI.
             for line in output.split('\n'):
                 line = line.strip()
-                if line.startswith('PAGE:') and callback:
-                    callback(f"Scanned page {line.split(':')[1]}...")
-                elif line.startswith('DUPLEX:'):
-                    self.log.info("Duplex status: %s", line.split(':', 1)[1])
+                if line.startswith('Scanned page') and callback:
+                    callback(line.rstrip('.') + "...")
 
             # SALVAGE: build the PDF from whatever pages reached disk, even if
-            # the script reported a partial error (e.g. ERROR_SAVE mid-batch).
-            page_count = len(glob.glob(os.path.join(batch_dir, "page_*.bmp")))
+            # NAPS2 reported a partial error mid-batch.
+            page_count = len(self._page_files(batch_dir))
             output_path = self._pages_to_pdf(batch_dir, callback=callback)
             if output_path:
                 self.last_saved_pdf = output_path
@@ -301,12 +274,11 @@ End If
                 shutil.rmtree(batch_dir, ignore_errors=True)
                 return True
 
-            # No pages were produced - surface a useful reason.
-            if 'ERROR_NO_SCANNER' in output:
-                reason = "No scanner found - check connection"
-            elif 'ERROR_CONNECT' in output:
-                reason = "Could not connect to scanner"
-            elif 'ERROR_NO_PAGES' in output:
+            # No pages were produced - surface a useful reason from NAPS2's output.
+            low = output.lower()
+            if 'no devices' in low or 'no scanning device' in low or 'device not found' in low:
+                reason = "No scanner found - check power/connection"
+            elif 'no pages' in low or 'feeder' in low or 'empty' in low:
                 reason = "No pages scanned - check feeder"
             else:
                 reason = "Scan failed - no pages captured"
@@ -353,7 +325,7 @@ End If
         """Remove any empty leftover batch folders (safe, non-destructive)."""
         try:
             for batch_dir in glob.glob(os.path.join(self.work_folder, "batch_*")):
-                if os.path.isdir(batch_dir) and not glob.glob(os.path.join(batch_dir, "page_*.bmp")):
+                if os.path.isdir(batch_dir) and not self._page_files(batch_dir):
                     shutil.rmtree(batch_dir, ignore_errors=True)
         except Exception:
             pass
